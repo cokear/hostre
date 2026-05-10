@@ -42,7 +42,7 @@ def send_tg_message(token, chat_id, message, photo_path=None):
             print(f"⚠️ Telegram 截图发送失败，回退到文本消息: {e}")
 
     text_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": safe_message, "parse_mode": "None"}
+    payload = {"chat_id": chat_id, "text": safe_message}
     try:
         response = requests.post(text_url, json=payload, timeout=10)
         response.raise_for_status()
@@ -52,8 +52,10 @@ def send_tg_message(token, chat_id, message, photo_path=None):
 
 
 def capture_failure_artifacts(page, prefix):
-    screenshot_path = f"{prefix}.png"
-    html_path = f"{prefix}.html"
+    # 加时间戳，避免多台机器跑下来截图互相覆盖
+    ts = int(time.time())
+    screenshot_path = f"{prefix}_{ts}.png"
+    html_path = f"{prefix}_{ts}.html"
 
     if not page:
         return None, None
@@ -245,6 +247,7 @@ def renew_host2play(url, proxy_url=None):
         co.set_argument("--disable-popup-blocking")
         co.set_argument("--window-size=1280,720")
 
+        # 每次都用全新的 user_data_dir，避免 Google 通过 cookie/指纹串联识别
         user_data_dir = tempfile.mkdtemp()
         co.set_user_data_path(user_data_dir)
         co.auto_port()
@@ -390,6 +393,15 @@ def renew_host2play(url, proxy_url=None):
                 time.sleep(10)
                 msg = "🎉 host2play 续期操作成功！"
                 success = True
+                # 成功也截一张图：用于在 TG 直观确认续期后的页面状态
+                try:
+                    ts = int(time.time())
+                    success_shot = f"success_{ts}.png"
+                    page.get_screenshot(path=success_shot, full_page=True)
+                    screenshot_path = success_shot
+                    print(f"📸 已保存成功截图: {success_shot}")
+                except Exception as shot_err:
+                    print(f"⚠️ 成功截图保存失败（不影响续期）: {shot_err}")
             else:
                 msg = "❌ host2play 找不到最终 Renew 按钮"
                 screenshot_path, _ = capture_failure_artifacts(
@@ -416,17 +428,67 @@ def renew_host2play(url, proxy_url=None):
         return success, msg, screenshot_path
 
 
+# ==============================================================================
+# 入口：支持多 URL（换行 / 逗号 / 单条 都兼容）
+# ==============================================================================
+def parse_urls(raw: str):
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    if "\n" in raw:
+        return [l.strip() for l in raw.splitlines() if l.strip()]
+    if "," in raw:
+        return [l.strip() for l in raw.split(",") if l.strip()]
+    return [raw]
+
+
 if __name__ == "__main__":
-    renew_url = os.getenv("RENEW_URL")
+    raw_urls = os.getenv("RENEW_URL", "")
     tg_token = os.getenv("TG_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
     proxy_url = os.getenv("PROXY", "127.0.0.1:1080")
 
-    if not renew_url:
+    urls = parse_urls(raw_urls)
+    if not urls:
         print("❌ 缺少 RENEW_URL")
         sys.exit(1)
 
-    is_success, result_message, screenshot_path = renew_host2play(renew_url, proxy_url)
-    send_tg_message(tg_token, tg_chat_id, result_message, screenshot_path)
-    if not is_success:
+    print(f"📋 共需续期 {len(urls)} 台服务器")
+
+    results = []
+    any_failed = False
+
+    for i, url in enumerate(urls, 1):
+        print(f"\n{'='*60}")
+        print(f"🔄 [{i}/{len(urls)}] 处理: {url}")
+        print(f"{'='*60}")
+
+        try:
+            ok, msg, shot = renew_host2play(url, proxy_url)
+        except Exception as e:
+            ok, msg, shot = False, f"💥 顶层异常: {str(e)[:200]}", None
+
+        # 单台一封 TG（出错带截图）
+        per_msg = f"[{i}/{len(urls)}] {msg}\n🔗 {url}"
+        send_tg_message(tg_token, tg_chat_id, per_msg, shot)
+
+        results.append((url, ok, msg))
+        if not ok:
+            any_failed = True
+
+        # 节点间冷却，避免 Google 把同一出口 IP 的连续 reCAPTCHA 关联起来
+        if i < len(urls):
+            cooldown = random.randint(45, 90)
+            print(f"😴 冷却 {cooldown}s 再处理下一台...")
+            time.sleep(cooldown)
+
+    # 末尾汇总
+    success_count = sum(1 for _, ok, _ in results if ok)
+    summary_lines = [f"📊 续期汇总：{success_count}/{len(results)} 成功"]
+    for u, ok, _ in results:
+        flag = "✅" if ok else "❌"
+        summary_lines.append(f"{flag} {u}")
+    send_tg_message(tg_token, tg_chat_id, "\n".join(summary_lines))
+
+    if any_failed:
         sys.exit(1)
