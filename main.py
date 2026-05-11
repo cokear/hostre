@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import random
@@ -49,6 +50,110 @@ def send_tg_message(token, chat_id, message, photo_path=None):
         print("✅ Telegram 文本通知发送成功！")
     except Exception as e:
         print(f"❌ Telegram 通知请求异常: {e}")
+
+
+# ==============================================================================
+# [v6] 剩余时间解析器（带单测）
+# 支持的输入示例：
+#   "Expires in: 04:16:03"             → 4*3600+16*60+3 = 15363
+#   "Expires in:\n04:16:03\nDeletes on:\n2026/05/18 00:59:26\nRenew server"
+#                                       → 15363（只看 Expires in 后面）
+#   "Expires in: 3 days, 12 hours"     → 3*86400 + 12*3600 = 302400
+#   "Expires in: 2d 5h 30m"            → 同上规则
+#   "Expires in:" / "" / None          → None（解析失败）
+# ==============================================================================
+def _parse_remaining_seconds(text):
+    """
+    把 "Expires in" 后面的剩余时间文本转成秒数。
+    解析失败返回 None。
+    """
+    if not text:
+        return None
+    s = str(text)
+
+    # 截取 "Expires in" 之后的内容
+    lower = s.lower()
+    idx = lower.find("expires in")
+    if idx >= 0:
+        s = s[idx + len("expires in"):]
+    # 去掉冒号和换行混入的 Deletes on 段
+    s = s.split("Deletes on")[0]
+    s = s.split("Renew server")[0]
+    s = s.strip(": \n\r\t")
+
+    if not s:
+        return None
+
+    # 形态 1: HH:MM:SS（最常见）
+    m = re.search(r"(\d{1,3}):(\d{2}):(\d{2})", s)
+    if m:
+        h, mn, sec = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return h * 3600 + mn * 60 + sec
+
+    # 形态 2: 带 day/hour/minute 的英文 / 中文
+    total = 0
+    matched = False
+    patterns = [
+        (r"(\d+)\s*(?:days|day|d|天)\b", 86400),
+        (r"(\d+)\s*(?:hours|hour|hr|h|小时)\b", 3600),
+        (r"(\d+)\s*(?:minutes|minute|min|m|分钟|分)\b", 60),
+        (r"(\d+)\s*(?:seconds|second|sec|s|秒)\b", 1),
+    ]
+    for pat, mult in patterns:
+        for m in re.finditer(pat, s, flags=re.IGNORECASE):
+            total += int(m.group(1)) * mult
+            matched = True
+    if matched:
+        return total
+
+    return None
+
+
+def _format_remaining(seconds):
+    """秒数 → 中文友好显示（用于 TG 汇总）"""
+    if seconds is None:
+        return "未知"
+    s = int(seconds)
+    days = s // 86400
+    s %= 86400
+    hours = s // 3600
+    s %= 3600
+    mins = s // 60
+    secs = s % 60
+    parts = []
+    if days:
+        parts.append(f"{days}天")
+    if hours or days:
+        parts.append(f"{hours}小时")
+    parts.append(f"{mins}分{secs:02d}秒")
+    return "".join(parts)
+
+
+# 模块自检（CI 跑 main.py 之前会先验证解析器）
+def _self_test_parser():
+    cases = [
+        ("Expires in: 04:16:03", 4 * 3600 + 16 * 60 + 3),
+        (
+            "Expires in:\n04:16:03\nDeletes on:\n2026/05/18 00:59:26\nRenew server",
+            4 * 3600 + 16 * 60 + 3,
+        ),
+        ("Expires in: 3 days, 12 hours", 3 * 86400 + 12 * 3600),
+        ("Expires in: 2d 5h 30m", 2 * 86400 + 5 * 3600 + 30 * 60),
+        ("Expires in:", None),
+        ("", None),
+        (None, None),
+    ]
+    failed = []
+    for text, expected in cases:
+        got = _parse_remaining_seconds(text)
+        if got != expected:
+            failed.append((text, expected, got))
+    if failed:
+        for text, expected, got in failed:
+            print(f"❌ 解析器单测失败: {text!r} → got={got}, expected={expected}")
+        return False
+    print("✅ 剩余时间解析器单测全部通过")
+    return True
 
 
 def capture_failure_artifacts(page, prefix):
@@ -224,6 +329,11 @@ class RecaptchaAudioSolver:
 # 核心续期业务逻辑
 # ==============================================================================
 def renew_host2play(url, proxy_url=None):
+    """
+    [v5] 返回值扩展：
+        (success, msg, screenshot, before_text, after_text, server_name)
+    用于上层组装"前后对比汇总"消息。
+    """
     print("启动 Xvfb 虚拟桌面...")
     vdisplay = Xvfb(width=1280, height=720, colordepth=24)
     vdisplay.start()
@@ -231,6 +341,9 @@ def renew_host2play(url, proxy_url=None):
     success = False
     msg = ""
     screenshot_path = None
+    before_text = ""
+    after_text = ""
+    server_name = ""
     page = None
 
     try:
@@ -276,6 +389,31 @@ def renew_host2play(url, proxy_url=None):
         print(f"🌐 访问续期目标网址: {url}")
         page.get(url, retry=3)
         time.sleep(random.uniform(5, 8))
+
+        # [v5] 尝试提取服务器名（用于汇总消息可读性）
+        try:
+            sn_ele = page.ele(
+                'xpath://*[contains(text(), "Renew server")'
+                ' or contains(text(), "Server name")'
+                ' or contains(text(), "Hostname")]',
+                timeout=2,
+            )
+            if sn_ele:
+                txt = (sn_ele.text or "").strip()
+                # 形如 "Renew server: mcf4008"
+                if ":" in txt:
+                    server_name = txt.split(":", 1)[1].strip()
+                else:
+                    server_name = txt
+        except Exception:
+            pass
+        # 兜底：用 URL 末段作为标识
+        if not server_name:
+            try:
+                server_name = url.rstrip("/").split("/")[-1][:24]
+            except Exception:
+                server_name = "unknown"
+        print(f"🏷️ 服务器标识: {server_name!r}")
 
         print("🧹 清理遮挡元素...")
         page.run_js("""
@@ -382,150 +520,218 @@ def renew_host2play(url, proxy_url=None):
 
         if solved_captcha:
             # ==================================================================
-            # [v3] 真正的续期验证流程
-            #   1) 等最终 Renew 按钮变 enabled (最多 30s)
-            #   2) 记录点击前的到期时间
-            #   3) 点击
-            #   4) 轮询 15s, 看到期时间变了 / 出现成功文案 才算成功
+            # [v4] 真正的续期验证流程（强化 disable 检测和到期文本读取）
             # ==================================================================
             print("🚀 reCAPTCHA 已通过，等待最终 Renew 按钮可用...")
 
-            def _is_btn_disabled(btn):
-                """判断按钮是否处于 disabled 状态。
-                Host2play 的 Renew 在 captcha token 没回填或时序未就绪时是灰的。
+            def _btn_disabled_reasons(btn):
+                """返回按钮 disabled 的原因列表（空 = 可点）。
+                覆盖：disabled 属性 / aria-disabled / class 含 disabled /
+                CSS pointer-events:none / opacity 过低
                 """
+                reasons = []
                 try:
                     if btn.attr("disabled") is not None:
-                        return True
-                    aria_dis = (btn.attr("aria-disabled") or "").lower()
-                    if aria_dis in ("true", "disabled"):
-                        return True
+                        reasons.append("disabled-attr")
+                    aria = (btn.attr("aria-disabled") or "").lower()
+                    if aria in ("true", "disabled"):
+                        reasons.append(f"aria={aria}")
                     cls = (btn.attr("class") or "").lower()
-                    if "disabled" in cls:
-                        return True
+                    if "disabled" in cls or "btn-disabled" in cls:
+                        reasons.append(f"class~disabled")
                 except Exception:
                     pass
-                return False
+                # CSS 层面检测
+                try:
+                    pe = page.run_js(
+                        "return window.getComputedStyle(arguments[0]).pointerEvents;",
+                        btn,
+                    )
+                    if pe == "none":
+                        reasons.append("pointer-events:none")
+                except Exception:
+                    pass
+                try:
+                    op = page.run_js(
+                        "return parseFloat(window.getComputedStyle(arguments[0])"
+                        ".opacity || '1');",
+                        btn,
+                    )
+                    if isinstance(op, (int, float)) and op < 0.6:
+                        reasons.append(f"opacity={op:.2f}")
+                except Exception:
+                    pass
+                return reasons
+
+            def _read_expire_text():
+                """读到期文本：先用 XPath 拿到节点，再爬到父节点取完整 innerText。
+                避免 host2play 把 'Expires in:' label 和数值放在两个 sibling span 时
+                只读到 label 的问题。
+                """
+                try:
+                    ele = page.ele(
+                        'xpath://*[contains(text(), "Expires in") '
+                        'or contains(text(), "Deletes on")]',
+                        timeout=2,
+                    )
+                    if not ele:
+                        return ""
+                    own = (ele.text or "").strip()
+                    # 如果自身文本看起来只是 label（无数字 / 太短），找父节点
+                    has_digit = any(c.isdigit() for c in own)
+                    if not has_digit or len(own) <= 15:
+                        try:
+                            parent = ele.parent()
+                            if parent:
+                                pt = (parent.text or "").strip()
+                                if pt and any(c.isdigit() for c in pt):
+                                    return pt
+                                # 再爬一层
+                                gp = parent.parent()
+                                if gp:
+                                    gpt = (gp.text or "").strip()
+                                    if gpt and any(c.isdigit() for c in gpt):
+                                        return gpt
+                        except Exception:
+                            pass
+                    return own
+                except Exception:
+                    return ""
 
             final_btn = None
+            last_reasons = []
             for wait_i in range(30):
                 btn = page.ele(
                     'xpath://button[normalize-space(text())="Renew"]', timeout=1
                 )
-                if btn and not _is_btn_disabled(btn):
-                    final_btn = btn
-                    print(f"✅ 最终 Renew 按钮已可点击 (等了 {wait_i}s)")
-                    break
                 if btn:
+                    reasons = _btn_disabled_reasons(btn)
+                    if not reasons:
+                        final_btn = btn
+                        print(f"✅ 最终 Renew 按钮已可点击 (等了 {wait_i}s)")
+                        break
+                    last_reasons = reasons
                     if wait_i == 0 or wait_i % 5 == 0:
-                        print(f"⏳ Renew 按钮仍 disabled，继续等... ({wait_i}s)")
+                        print(f"⏳ Renew 仍 disabled [{','.join(reasons)}] ({wait_i}s)")
                 else:
                     if wait_i == 0:
                         print("⏳ 暂未找到 Renew 按钮，等待...")
                 time.sleep(1)
 
             if not final_btn:
+                reasons_str = ",".join(last_reasons) if last_reasons else "未找到按钮"
                 msg = (
-                    "❌ host2play 最终 Renew 按钮 30s 内一直 disabled "
-                    "(reCAPTCHA token 可能没回填或站点节流，建议加大冷却或重跑)"
+                    f"❌ host2play Renew 按钮 30s 内一直不可点 "
+                    f"[{reasons_str}]，疑似 reCAPTCHA token 未回填或站点节流"
                 )
                 screenshot_path, _ = capture_failure_artifacts(
                     page, "error_btn_disabled"
                 )
             else:
-                # 记录点击前的到期时间作为对照
-                old_expire_text = ""
-                try:
-                    expire_ele = page.ele(
-                        'xpath://*[contains(text(), "Expires in") '
-                        'or contains(text(), "Deletes on")]',
-                        timeout=2,
-                    )
-                    if expire_ele:
-                        old_expire_text = (expire_ele.text or "").strip()
-                except Exception:
-                    pass
-                print(f"📌 点击前到期文本: {old_expire_text!r}")
+                # 记录点击前快照
+                old_expire_text = _read_expire_text()
+                before_text = old_expire_text
+                before_seconds = _parse_remaining_seconds(old_expire_text)
+                print(f"📌 续期前剩余文本: {old_expire_text!r}  ≈ {before_seconds}s")
 
                 try:
                     final_btn.click()
                 except Exception:
                     final_btn.click(by_js=True)
-                print("👇 已点击最终 Renew，开始验证页面变化...")
+                print("👇 已点击最终 Renew，等待弹窗关闭...")
 
-                # 轮询 15s 确认续期真的生效
-                verified = False
-                new_expire_text = ""
-                for poll_i in range(15):
+                # ----------------------------------------------------------
+                # [v6] 关键修正：先等弹窗关掉，然后 page.refresh()
+                # 不再依赖"按钮消失"这种 DOM 信号当作成功证据，
+                # 唯一硬标准 = reload 后剩余时间至少多 1 小时
+                # ----------------------------------------------------------
+                modal_closed = False
+                for _ in range(15):
                     time.sleep(1)
+                    btn_check = page.ele(
+                        'xpath://button[normalize-space(text())="Renew"]',
+                        timeout=0.3,
+                    )
+                    if not btn_check:
+                        modal_closed = True
+                        print("📭 续期弹窗已关闭")
+                        break
 
-                    # 1) 到期时间文本变化
+                # 不论弹窗关没关，都强制 reload，host2play 主页面不会自动更新
+                print("🔄 强制刷新页面以拉取最新到期信息...")
+                try:
+                    page.refresh()
+                    time.sleep(random.uniform(4, 6))
+                except Exception as ref_err:
+                    print(f"⚠️ refresh 失败，回退到 page.get(url): {ref_err}")
                     try:
-                        ne = page.ele(
-                            'xpath://*[contains(text(), "Expires in") '
-                            'or contains(text(), "Deletes on")]',
-                            timeout=0.5,
-                        )
-                        if ne:
-                            t = (ne.text or "").strip()
-                            if t and t != old_expire_text:
-                                new_expire_text = t
-                                verified = True
-                                print(
-                                    f"✅ 到期文本已更新: "
-                                    f"{old_expire_text!r} → {t!r}"
-                                )
-                                break
+                        page.get(url, retry=2)
+                        time.sleep(random.uniform(4, 6))
                     except Exception:
                         pass
 
-                    # 2) 兜底：页面文字含成功关键字
-                    try:
-                        page_text = (page.html or "").lower()
-                        for kw in (
-                            "successfully renewed",
-                            "server renewed",
-                            "renewed successfully",
-                            "renewal successful",
-                        ):
-                            if kw in page_text:
-                                verified = True
-                                print(f"✅ 检测到成功关键字: {kw}")
-                                break
-                        if verified:
-                            break
-                    except Exception:
-                        pass
+                # 读取 reload 后的剩余时间
+                new_expire_text = _read_expire_text()
+                after_text = new_expire_text
+                after_seconds = _parse_remaining_seconds(new_expire_text)
+                print(f"📌 续期后剩余文本: {new_expire_text!r}  ≈ {after_seconds}s")
 
-                if verified:
-                    if new_expire_text:
-                        msg = (
-                            f"🎉 host2play 续期成功！\n"
-                            f"   {old_expire_text} → {new_expire_text}"
-                        )
-                    else:
-                        msg = "🎉 host2play 续期成功（检测到成功文案）"
+                # 不论成功失败都先截一张图（页面已 reload，反映最新真实状态）
+                try:
+                    ts = int(time.time())
+                    final_shot = f"after_renew_{ts}.png"
+                    page.get_screenshot(path=final_shot, full_page=True)
+                    screenshot_path = final_shot
+                    print(f"📸 已保存 reload 后截图: {final_shot}")
+                except Exception as shot_err:
+                    print(f"⚠️ 截图保存失败: {shot_err}")
+
+                # ----------------------------------------------------------
+                # [v6] 严格成功判定：剩余秒数至少多 3600s（1 小时）
+                # ----------------------------------------------------------
+                SUCCESS_DELTA_SECONDS = 3600
+                if (
+                    after_seconds is not None
+                    and before_seconds is not None
+                    and after_seconds >= before_seconds + SUCCESS_DELTA_SECONDS
+                ):
                     success = True
-                    # 成功截图
-                    try:
-                        ts = int(time.time())
-                        success_shot = f"success_{ts}.png"
-                        page.get_screenshot(path=success_shot, full_page=True)
-                        screenshot_path = success_shot
-                        print(f"📸 已保存成功截图: {success_shot}")
-                    except Exception as shot_err:
-                        print(f"⚠️ 成功截图保存失败（不影响续期）: {shot_err}")
-                else:
+                    delta_h = (after_seconds - before_seconds) / 3600.0
                     msg = (
-                        f"❌ host2play 点了 Renew 但 15s 内页面无变化 "
-                        f"(到期文本仍为 {old_expire_text!r}，疑似服务端拒绝或 "
-                        f"reCAPTCHA token 失效)"
+                        f"🎉 host2play 续期成功（剩余时间 +{delta_h:.1f}h）"
                     )
-                    screenshot_path, _ = capture_failure_artifacts(
-                        page, "error_no_change_after_click"
+                elif (
+                    after_seconds is not None
+                    and before_seconds is not None
+                    and after_seconds < before_seconds + SUCCESS_DELTA_SECONDS
+                ):
+                    # 时间没变长 → 真失败
+                    success = False
+                    msg = (
+                        f"❌ host2play 续期失败：剩余时间未明显增加"
+                        f"（前 {before_seconds}s → 后 {after_seconds}s）"
                     )
+                else:
+                    # 解析失败时退化为字符串对比 + 弹窗关闭综合判断
+                    if (
+                        new_expire_text
+                        and old_expire_text
+                        and new_expire_text != old_expire_text
+                    ):
+                        success = True
+                        msg = "🎉 host2play 续期成功（文本变化）"
+                    elif modal_closed and not new_expire_text:
+                        # 极端：reload 后读不到 expire，但弹窗确实关了
+                        success = True
+                        msg = "🎉 host2play 续期成功（弹窗关闭，但解析剩余时间失败）"
+                    else:
+                        success = False
+                        msg = (
+                            f"❌ host2play 续期失败：剩余时间无变化"
+                            f"（reload 后仍 {new_expire_text!r}）"
+                        )
         else:
-            if "操作成功" not in msg and "续期成功" not in msg:
+            if "续期成功" not in msg:
                 msg = "❌ host2play 无法通过 reCAPTCHA"
                 screenshot_path, _ = capture_failure_artifacts(
                     page, "error_captcha_failed"
@@ -542,7 +748,7 @@ def renew_host2play(url, proxy_url=None):
             except:
                 pass
         vdisplay.stop()
-        return success, msg, screenshot_path
+        return success, msg, screenshot_path, before_text, after_text, server_name
 
 
 # ==============================================================================
@@ -560,6 +766,11 @@ def parse_urls(raw: str):
 
 
 if __name__ == "__main__":
+    # [v6] 启动时自检解析器，避免线上跑出靠运气的判定
+    if not _self_test_parser():
+        print("⚠️ 剩余时间解析器单测失败，请检查 _parse_remaining_seconds")
+        sys.exit(1)
+
     raw_urls = os.getenv("RENEW_URL", "")
     tg_token = os.getenv("TG_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
@@ -581,31 +792,98 @@ if __name__ == "__main__":
         print(f"{'='*60}")
 
         try:
-            ok, msg, shot = renew_host2play(url, proxy_url)
+            ok, msg, shot, before, after, server = renew_host2play(url, proxy_url)
         except Exception as e:
-            ok, msg, shot = False, f"💥 顶层异常: {str(e)[:200]}", None
+            ok = False
+            msg = f"💥 顶层异常: {str(e)[:200]}"
+            shot = None
+            before = ""
+            after = ""
+            server = url.rstrip("/").split("/")[-1][:24]
 
-        # 单台一封 TG（出错带截图）
-        per_msg = f"[{i}/{len(urls)}] {msg}\n🔗 {url}"
-        send_tg_message(tg_token, tg_chat_id, per_msg, shot)
+        # 失败的立即发独立 TG（带截图，方便即时看到现场）
+        if not ok:
+            per_msg = (
+                f"[{i}/{len(urls)}] ❌ {server} 续期失败\n"
+                f"{msg}\n🔗 {url}"
+            )
+            send_tg_message(tg_token, tg_chat_id, per_msg, shot)
 
-        results.append((url, ok, msg))
+        results.append({
+            "url": url,
+            "server": server or "?",
+            "ok": ok,
+            "msg": msg,
+            "before_text": before,
+            "after_text": after,
+            "before_seconds": _parse_remaining_seconds(before),
+            "after_seconds": _parse_remaining_seconds(after),
+            "screenshot": shot,
+        })
         if not ok:
             any_failed = True
 
-        # 节点间冷却，避免 Google 把同一出口 IP 的连续 reCAPTCHA 关联起来
+        # 节点间冷却
         if i < len(urls):
             cooldown = random.randint(45, 90)
             print(f"😴 冷却 {cooldown}s 再处理下一台...")
             time.sleep(cooldown)
 
-    # 末尾汇总
-    success_count = sum(1 for _, ok, _ in results if ok)
-    summary_lines = [f"📊 续期汇总：{success_count}/{len(results)} 成功"]
-    for u, ok, _ in results:
-        flag = "✅" if ok else "❌"
-        summary_lines.append(f"{flag} {u}")
-    send_tg_message(tg_token, tg_chat_id, "\n".join(summary_lines))
+    # ==========================================================================
+    # [v6] 中文化汇总消息
+    # ==========================================================================
+    success_count = sum(1 for r in results if r["ok"])
+    total = len(results)
+
+    SEP = "━━━━━━━━━━━━━━━━━━━━"
+    summary_lines = [
+        f"🎯 host2play 续期汇总  {success_count}/{total} 成功",
+        SEP,
+    ]
+
+    for r in results:
+        flag = "✅" if r["ok"] else "❌"
+        verdict = "续期成功" if r["ok"] else "续期失败"
+        summary_lines.append(f"{flag} {r['server']}  {verdict}")
+
+        before_disp = _format_remaining(r["before_seconds"])
+        after_disp = _format_remaining(r["after_seconds"])
+        summary_lines.append(f"  续期前剩余  {before_disp}")
+        summary_lines.append(f"  续期后剩余  {after_disp}")
+
+        # 计算变化量（如果两个都解析出来了）
+        if (
+            r["before_seconds"] is not None
+            and r["after_seconds"] is not None
+        ):
+            delta = r["after_seconds"] - r["before_seconds"]
+            if delta > 0:
+                summary_lines.append(f"  本次新增    {_format_remaining(delta)}")
+            elif delta < 0:
+                summary_lines.append(f"  ⚠️ 时间反而减少 {_format_remaining(-delta)}")
+
+        if not r["ok"]:
+            reason = r["msg"].split("\n", 1)[0][:120]
+            summary_lines.append(f"  失败原因    {reason}")
+
+        summary_lines.append(SEP)
+
+    summary_text = "\n".join(summary_lines)
+
+    # 汇总也带一张图：用第一台成功机器的 reload 截图作为视觉证据
+    summary_shot = None
+    for r in results:
+        if r["ok"] and r["screenshot"]:
+            summary_shot = r["screenshot"]
+            break
+    # 如果没有成功的，就用第一台失败的截图
+    if not summary_shot:
+        for r in results:
+            if r["screenshot"]:
+                summary_shot = r["screenshot"]
+                break
+
+    send_tg_message(tg_token, tg_chat_id, summary_text, summary_shot)
 
     if any_failed:
         sys.exit(1)
