@@ -476,58 +476,48 @@ def renew_host2play(url, proxy_url=None):
                         ) or ""
                     except Exception:
                         delete_raw = ""
-                    expire_raw = re.sub(r"\s+", " ", str(expire_raw)).strip(" :\t\r\n")
-                    delete_raw = re.sub(r"\s+", " ", str(delete_raw)).strip(" :\t\r\n")
+                    expire_raw = _normalize_expire_text(expire_raw)
+                    if expire_raw.lower().startswith("expires in:"):
+                        expire_raw = expire_raw.split(":", 1)[1].strip()
+                    delete_raw = _normalize_expire_text(delete_raw)
+                    if delete_raw.lower().startswith("deletes on:"):
+                        delete_raw = delete_raw.split(":", 1)[1].strip()
                     return expire_raw, delete_raw
 
-                def _parse_delete_epoch(v):
-                    if not v:
-                        return None
-                    s = str(v).strip()
-                    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                        try:
-                            return time.mktime(time.strptime(s, fmt))
-                        except Exception:
-                            continue
-                    return None
-
-                def _parse_expire_seconds(v):
-                    if not v:
-                        return None
-                    s = str(v).strip().lower()
-                    m = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", s)
-                    if m:
-                        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
-                    m = re.search(r"(\d+)\s*day[s]?\s*(\d+)\s*h", s)
-                    if m:
-                        return int(m.group(1)) * 86400 + int(m.group(2)) * 3600
-                    m = re.search(r"(\d+)\s*day[s]?", s)
-                    if m:
-                        return int(m.group(1)) * 86400
-                    m = re.search(r"(\d+)\s*h\b", s)
-                    if m:
-                        return int(m.group(1)) * 3600
-                    return None
-
                 def _normalize_expire_text(raw_text):
-                    text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+                    raw = str(raw_text or "").strip()
+                    text = re.sub(r"\s+", " ", raw).strip()
                     if not text:
                         return ""
 
-                    m = re.search(r"Expires in[:：]?\s*([^,\n\r|]+)", text, re.IGNORECASE)
-                    if m:
-                        v = m.group(1).strip(" :\t\r\n")
-                        # 排除 "Expires in: :" 这类只有标签无值
-                        if not v or v in (":", "-"):
-                            return ""
-                        return f"Expires in: {v}"
+                    bad_value_words = ("expires in", "deletes on", "renew server", "renew")
+                    time_patterns = (
+                        r"\b\d{1,2}:\d{2}:\d{2}\b",
+                        r"\b\d+\s*day[s]?\s*\d+\s*h\b",
+                        r"\b\d+\s*day[s]?\b",
+                        r"\b\d+\s*h\b",
+                    )
 
-                    m = re.search(r"Deletes on[:：]?\s*([^,\n\r|]+)", text, re.IGNORECASE)
+                    for pattern in time_patterns:
+                        m = re.search(r"Expires in[:：]?\s*(" + pattern + ")", raw, re.IGNORECASE)
+                        if m:
+                            value = re.sub(r"\s+", " ", m.group(1)).strip()
+                            return f"Expires in: {value}"
+
+                    m = re.search(
+                        r"Deletes on[:：]?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2}(?:\s+\d{1,2}:\d{2}:\d{2})?)",
+                        raw,
+                        re.IGNORECASE,
+                    )
                     if m:
                         v = m.group(1).strip(" :\t\r\n")
-                        if not v or v in (":", "-"):
+                        if not v or v in (":", "-") or any(w in v.lower() for w in bad_value_words):
                             return ""
                         return f"Deletes on: {v}"
+
+                    m = re.search(r"\b\d{1,2}:\d{2}:\d{2}\b", text)
+                    if m:
+                        return f"Expires in: {m.group(0)}"
 
                     m = re.search(r"\b\d+\s*day[s]?\s*\d+\s*h\b", text, re.IGNORECASE)
                     if m:
