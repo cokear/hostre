@@ -663,138 +663,65 @@ def renew_host2play(url, proxy_url=None):
                 old_expire_text = _read_expire_text()
                 before_text = old_expire_text  # [v5] 暴露给上层
                 print(f"📌 点击前到期文本: {old_expire_text!r}")
-                old_expire_raw, old_delete_raw = _get_expire_and_delete()
-                old_delete_epoch = _parse_delete_epoch(old_delete_raw)
-                old_expire_secs = _parse_expire_seconds(old_expire_raw)
 
                 try:
                     final_btn.click()
                 except Exception:
                     final_btn.click(by_js=True)
-                print("👇 已点击最终 Renew，开始验证页面变化...")
+                print("👇 已点击最终 Renew，等待页面更新...")
+                time.sleep(10)
 
-                # 多重验证信号，任一满足即视为成功
                 verified = False
-                new_expire_text = ""
                 success_reason = ""
+                new_expire_text = _read_expire_text() or ""
+                after_text = new_expire_text or old_expire_text
 
-                for poll_i in range(15):
-                    time.sleep(1)
-
-                    # 信号 A1：绝对到期时间必须增长
-                    cur_expire_raw, cur_delete_raw = _get_expire_and_delete()
-                    cur_delete_epoch = _parse_delete_epoch(cur_delete_raw)
-                    if (
-                        old_delete_epoch is not None
-                        and cur_delete_epoch is not None
-                        and cur_delete_epoch > old_delete_epoch
-                    ):
-                        new_expire_text = f"Deletes on: {cur_delete_raw}"
-                        verified = True
-                        success_reason = "deleteDate 增长"
-                        print(f"✅ deleteDate 增长: {old_delete_raw!r} → {cur_delete_raw!r}")
-                        break
-
-                    # 信号 A2：倒计时明显回跳增长（避免 07:53:11→07:53:10 误判）
-                    cur_expire_secs = _parse_expire_seconds(cur_expire_raw)
-                    if (
-                        old_expire_secs is not None
-                        and cur_expire_secs is not None
-                        and cur_expire_secs > old_expire_secs + 30
-                    ):
-                        new_expire_text = f"Expires in: {cur_expire_raw}"
-                        verified = True
-                        success_reason = "expireDate 回跳增长"
-                        print(f"✅ expireDate 回跳增长: {old_expire_raw!r} → {cur_expire_raw!r}")
-                        break
-
-                    # 信号 B：续期弹窗里的 Renew 按钮消失了 (modal 关闭)
-                    try:
-                        still_btn = page.ele(
-                            'xpath://button[normalize-space(text())="Renew"]',
-                            timeout=0.3,
-                        )
-                        if not still_btn:
-                            verified = True
-                            success_reason = "Renew 按钮消失（弹窗已关闭）"
-                            print(f"✅ Renew 按钮消失，推测续期已完成")
-                            # 尝试读最新 expire 作为 new_expire_text
-                            new_expire_text = _read_expire_text() or ""
-                            break
-                    except Exception:
-                        pass
-
-                    # 信号 C：页面文字含成功关键字
+                if new_expire_text and new_expire_text != "未知" and new_expire_text != old_expire_text:
+                    verified = True
+                    success_reason = "到期时间已变化"
+                    print(f"✅ 到期时间已更新: {old_expire_text!r} → {new_expire_text!r}")
+                else:
                     try:
                         page_text = (page.html or "").lower()
-                        for kw in (
-                            "successfully renewed",
-                            "server renewed",
-                            "renewed successfully",
-                            "renewal successful",
-                            "successfully extended",
-                        ):
-                            if kw in page_text:
-                                verified = True
-                                success_reason = f"成功关键字: {kw}"
-                                new_expire_text = _read_expire_text() or ""
-                                print(f"✅ 检测到成功文案: {kw}")
-                                break
-                        if verified:
-                            break
                     except Exception:
-                        pass
+                        page_text = ""
+                    for kw in (
+                        "successfully renewed",
+                        "server renewed",
+                        "renewed successfully",
+                        "renewal successful",
+                        "successfully extended",
+                        "successfully",
+                        "renewed",
+                    ):
+                        if kw in page_text:
+                            verified = True
+                            success_reason = f"成功关键字: {kw}"
+                            print(f"✅ 检测到成功文案: {kw}")
+                            break
+
+                if verified and (not new_expire_text or new_expire_text == old_expire_text):
+                    # 成功后有时需要刷新才能读到新时间；这里只刷新一次，不做增长轮询。
+                    try:
+                        print("🔄 成功后时间未更新，刷新一次后重读...")
+                        page.refresh()
+                        time.sleep(4)
+                        refreshed_expire = _read_expire_text() or ""
+                        if refreshed_expire:
+                            new_expire_text = refreshed_expire
+                            after_text = refreshed_expire
+                            print(f"📌 刷新后到期文本: {refreshed_expire!r}")
+                    except Exception as refresh_err:
+                        print(f"⚠️ 刷新后重读失败: {refresh_err}")
 
                 if verified:
-                    # [v5] 记录 after_text 用于汇总；做短重试，尽量拿到更新后的值
-                    after_text = new_expire_text or _read_expire_text() or ""
-                    if not after_text:
-                        for _ in range(8):
-                            time.sleep(1)
-                            probe = _read_expire_text()
-                            if probe:
-                                after_text = probe
-                                break
-                    if (not after_text) or (old_expire_text and after_text == old_expire_text):
-                        # 站点有时点击后不立刻刷字段，强制刷新一次再读
-                        try:
-                            print("🔄 续期后时间未更新，执行一次刷新后重读...")
-                            page.refresh()
-                            time.sleep(4)
-                            for _ in range(10):
-                                cur_expire_raw, cur_delete_raw = _get_expire_and_delete()
-                                cur_delete_epoch = _parse_delete_epoch(cur_delete_raw)
-                                cur_expire_secs = _parse_expire_seconds(cur_expire_raw)
-                                if (
-                                    old_delete_epoch is not None
-                                    and cur_delete_epoch is not None
-                                    and cur_delete_epoch > old_delete_epoch
-                                ):
-                                    after_text = f"Deletes on: {cur_delete_raw}"
-                                    break
-                                if (
-                                    old_expire_secs is not None
-                                    and cur_expire_secs is not None
-                                    and cur_expire_secs > old_expire_secs + 30
-                                ):
-                                    after_text = f"Expires in: {cur_expire_raw}"
-                                    break
-                                probe = _read_expire_text()
-                                if probe:
-                                    after_text = probe
-                                time.sleep(1)
-                        except Exception as refresh_err:
-                            print(f"⚠️ 刷新后重读失败: {refresh_err}")
-
-                    if new_expire_text and new_expire_text != old_expire_text:
+                    if new_expire_text and new_expire_text != "未知" and new_expire_text != old_expire_text:
                         msg = (
                             f"🎉 host2play 续期成功！[{success_reason}]\n"
                             f"   {old_expire_text} → {new_expire_text}"
                         )
                     else:
-                        msg = (
-                            f"🎉 host2play 续期成功！[{success_reason}]"
-                        )
+                        msg = f"🎉 host2play 续期成功！[{success_reason}]"
                     success = True
                     # 成功截图
                     try:
@@ -806,7 +733,6 @@ def renew_host2play(url, proxy_url=None):
                     except Exception as shot_err:
                         print(f"⚠️ 成功截图保存失败（不影响续期）: {shot_err}")
                 else:
-                    # 真失败前再做一次 disable 检测，给排查线索
                     cur_reasons = []
                     try:
                         cur_btn = page.ele(
@@ -823,9 +749,9 @@ def renew_host2play(url, proxy_url=None):
                     # [v5] 即便失败也记一次 after_text
                     after_text = _read_expire_text() or old_expire_text
                     msg = (
-                        f"❌ host2play 点了 Renew 但 15s 内页面无变化"
+                        f"❌ host2play 点了 Renew 但页面无成功信号"
                         f"{diag}\n"
-                        f"   到期文本: {old_expire_text!r} (始终未变)"
+                        f"   到期文本: {old_expire_text!r} → {after_text!r}"
                     )
                     screenshot_path, _ = capture_failure_artifacts(
                         page, "error_no_change_after_click"
