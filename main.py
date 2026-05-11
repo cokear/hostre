@@ -461,6 +461,54 @@ def renew_host2play(url, proxy_url=None):
 
             def _read_expire_text():
                 """读取并归一化到期文本，优先抓取 Expire/Deletes 关键值。"""
+                def _get_expire_and_delete():
+                    expire_raw = ""
+                    delete_raw = ""
+                    try:
+                        expire_raw = page.run_js(
+                            "var e=document.querySelector('#expireDate'); return e ? (e.innerText||e.textContent||'') : '';"
+                        ) or ""
+                    except Exception:
+                        expire_raw = ""
+                    try:
+                        delete_raw = page.run_js(
+                            "var e=document.querySelector('#deleteDate'); return e ? (e.innerText||e.textContent||'') : '';"
+                        ) or ""
+                    except Exception:
+                        delete_raw = ""
+                    expire_raw = re.sub(r"\s+", " ", str(expire_raw)).strip(" :\t\r\n")
+                    delete_raw = re.sub(r"\s+", " ", str(delete_raw)).strip(" :\t\r\n")
+                    return expire_raw, delete_raw
+
+                def _parse_delete_epoch(v):
+                    if not v:
+                        return None
+                    s = str(v).strip()
+                    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                        try:
+                            return time.mktime(time.strptime(s, fmt))
+                        except Exception:
+                            continue
+                    return None
+
+                def _parse_expire_seconds(v):
+                    if not v:
+                        return None
+                    s = str(v).strip().lower()
+                    m = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", s)
+                    if m:
+                        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+                    m = re.search(r"(\d+)\s*day[s]?\s*(\d+)\s*h", s)
+                    if m:
+                        return int(m.group(1)) * 86400 + int(m.group(2)) * 3600
+                    m = re.search(r"(\d+)\s*day[s]?", s)
+                    if m:
+                        return int(m.group(1)) * 86400
+                    m = re.search(r"(\d+)\s*h\b", s)
+                    if m:
+                        return int(m.group(1)) * 3600
+                    return None
+
                 def _normalize_expire_text(raw_text):
                     text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
                     if not text:
@@ -501,23 +549,9 @@ def renew_host2play(url, proxy_url=None):
 
                 try:
                     # 最高优先：直接读取已知稳定节点
-                    try:
-                        expire_raw = page.run_js(
-                            "var e=document.querySelector('#expireDate'); return e ? (e.innerText||e.textContent||'') : '';"
-                        ) or ""
-                    except Exception:
-                        expire_raw = ""
-                    expire_raw = re.sub(r"\s+", " ", str(expire_raw)).strip(" :\t\r\n")
+                    expire_raw, delete_raw = _get_expire_and_delete()
                     if expire_raw:
                         return f"Expires in: {expire_raw}"
-
-                    try:
-                        delete_raw = page.run_js(
-                            "var e=document.querySelector('#deleteDate'); return e ? (e.innerText||e.textContent||'') : '';"
-                        ) or ""
-                    except Exception:
-                        delete_raw = ""
-                    delete_raw = re.sub(r"\s+", " ", str(delete_raw)).strip(" :\t\r\n")
                     if delete_raw:
                         return f"Deletes on: {delete_raw}"
 
@@ -629,6 +663,9 @@ def renew_host2play(url, proxy_url=None):
                 old_expire_text = _read_expire_text()
                 before_text = old_expire_text  # [v5] 暴露给上层
                 print(f"📌 点击前到期文本: {old_expire_text!r}")
+                old_expire_raw, old_delete_raw = _get_expire_and_delete()
+                old_delete_epoch = _parse_delete_epoch(old_delete_raw)
+                old_expire_secs = _parse_expire_seconds(old_expire_raw)
 
                 try:
                     final_btn.click()
@@ -644,13 +681,31 @@ def renew_host2play(url, proxy_url=None):
                 for poll_i in range(15):
                     time.sleep(1)
 
-                    # 信号 A：到期文本变了
-                    cur_expire = _read_expire_text()
-                    if cur_expire and cur_expire != old_expire_text:
-                        new_expire_text = cur_expire
+                    # 信号 A1：绝对到期时间必须增长
+                    cur_expire_raw, cur_delete_raw = _get_expire_and_delete()
+                    cur_delete_epoch = _parse_delete_epoch(cur_delete_raw)
+                    if (
+                        old_delete_epoch is not None
+                        and cur_delete_epoch is not None
+                        and cur_delete_epoch > old_delete_epoch
+                    ):
+                        new_expire_text = f"Deletes on: {cur_delete_raw}"
                         verified = True
-                        success_reason = "expire 文本变化"
-                        print(f"✅ 到期文本已更新: {old_expire_text!r} → {cur_expire!r}")
+                        success_reason = "deleteDate 增长"
+                        print(f"✅ deleteDate 增长: {old_delete_raw!r} → {cur_delete_raw!r}")
+                        break
+
+                    # 信号 A2：倒计时明显回跳增长（避免 07:53:11→07:53:10 误判）
+                    cur_expire_secs = _parse_expire_seconds(cur_expire_raw)
+                    if (
+                        old_expire_secs is not None
+                        and cur_expire_secs is not None
+                        and cur_expire_secs > old_expire_secs + 30
+                    ):
+                        new_expire_text = f"Expires in: {cur_expire_raw}"
+                        verified = True
+                        success_reason = "expireDate 回跳增长"
+                        print(f"✅ expireDate 回跳增长: {old_expire_raw!r} → {cur_expire_raw!r}")
                         break
 
                     # 信号 B：续期弹窗里的 Renew 按钮消失了 (modal 关闭)
@@ -693,11 +748,11 @@ def renew_host2play(url, proxy_url=None):
                 if verified:
                     # [v5] 记录 after_text 用于汇总；做短重试，尽量拿到更新后的值
                     after_text = new_expire_text or _read_expire_text() or ""
-                    if (not after_text) or (old_expire_text and after_text == old_expire_text):
+                    if not after_text:
                         for _ in range(8):
                             time.sleep(1)
                             probe = _read_expire_text()
-                            if probe and (not old_expire_text or probe != old_expire_text):
+                            if probe:
                                 after_text = probe
                                 break
                     if (not after_text) or (old_expire_text and after_text == old_expire_text):
@@ -706,11 +761,27 @@ def renew_host2play(url, proxy_url=None):
                             print("🔄 续期后时间未更新，执行一次刷新后重读...")
                             page.refresh()
                             time.sleep(4)
-                            for _ in range(6):
-                                probe = _read_expire_text()
-                                if probe and (not old_expire_text or probe != old_expire_text):
-                                    after_text = probe
+                            for _ in range(10):
+                                cur_expire_raw, cur_delete_raw = _get_expire_and_delete()
+                                cur_delete_epoch = _parse_delete_epoch(cur_delete_raw)
+                                cur_expire_secs = _parse_expire_seconds(cur_expire_raw)
+                                if (
+                                    old_delete_epoch is not None
+                                    and cur_delete_epoch is not None
+                                    and cur_delete_epoch > old_delete_epoch
+                                ):
+                                    after_text = f"Deletes on: {cur_delete_raw}"
                                     break
+                                if (
+                                    old_expire_secs is not None
+                                    and cur_expire_secs is not None
+                                    and cur_expire_secs > old_expire_secs + 30
+                                ):
+                                    after_text = f"Expires in: {cur_expire_raw}"
+                                    break
+                                probe = _read_expire_text()
+                                if probe:
+                                    after_text = probe
                                 time.sleep(1)
                         except Exception as refresh_err:
                             print(f"⚠️ 刷新后重读失败: {refresh_err}")
