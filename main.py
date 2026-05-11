@@ -468,11 +468,18 @@ def renew_host2play(url, proxy_url=None):
 
                     m = re.search(r"Expires in[:：]?\s*([^,\n\r|]+)", text, re.IGNORECASE)
                     if m:
-                        return f"Expires in: {m.group(1).strip()}"
+                        v = m.group(1).strip(" :\t\r\n")
+                        # 排除 "Expires in: :" 这类只有标签无值
+                        if not v or v in (":", "-"):
+                            return ""
+                        return f"Expires in: {v}"
 
                     m = re.search(r"Deletes on[:：]?\s*([^,\n\r|]+)", text, re.IGNORECASE)
                     if m:
-                        return f"Deletes on: {m.group(1).strip()}"
+                        v = m.group(1).strip(" :\t\r\n")
+                        if not v or v in (":", "-"):
+                            return ""
+                        return f"Deletes on: {v}"
 
                     m = re.search(r"\b\d+\s*day[s]?\s*\d+\s*h\b", text, re.IGNORECASE)
                     if m:
@@ -493,6 +500,27 @@ def renew_host2play(url, proxy_url=None):
                     return ""
 
                 try:
+                    # 最高优先：直接读取已知稳定节点
+                    try:
+                        expire_raw = page.run_js(
+                            "var e=document.querySelector('#expireDate'); return e ? (e.innerText||e.textContent||'') : '';"
+                        ) or ""
+                    except Exception:
+                        expire_raw = ""
+                    expire_raw = re.sub(r"\s+", " ", str(expire_raw)).strip(" :\t\r\n")
+                    if expire_raw:
+                        return f"Expires in: {expire_raw}"
+
+                    try:
+                        delete_raw = page.run_js(
+                            "var e=document.querySelector('#deleteDate'); return e ? (e.innerText||e.textContent||'') : '';"
+                        ) or ""
+                    except Exception:
+                        delete_raw = ""
+                    delete_raw = re.sub(r"\s+", " ", str(delete_raw)).strip(" :\t\r\n")
+                    if delete_raw:
+                        return f"Deletes on: {delete_raw}"
+
                     ele = page.ele(
                         'xpath://*[contains(text(), "Expires in") '
                         'or contains(text(), "Deletes on")]',
@@ -502,6 +530,46 @@ def renew_host2play(url, proxy_url=None):
                         own = _normalize_expire_text(ele.text or "")
                         if own:
                             return own
+                        # 同级/父级精确提取，避免只拿到 "Expires in:" 标签
+                        try:
+                            precise = page.run_js(
+                                r"""
+                                return (function(el){
+                                    function clean(t){ return String(t||'').replace(/\s+/g,' ').trim(); }
+                                    function pick(t){
+                                        t = clean(t);
+                                        if (!t) return '';
+                                        var m = t.match(/\b\d+\s*day[s]?\s*\d+\s*h\b/i);
+                                        if (m) return clean(m[0]);
+                                        m = t.match(/\b\d+\s*day[s]?\b/i);
+                                        if (m) return clean(m[0]);
+                                        m = t.match(/\b\d+\s*h\b/i);
+                                        if (m) return clean(m[0]);
+                                        m = t.match(/\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b/);
+                                        if (m) return clean(m[0]);
+                                        return '';
+                                    }
+                                    var line = el;
+                                    for (var i=0;i<3 && line;i++){
+                                        var p = pick(line.innerText || line.textContent || '');
+                                        if (p) return p;
+                                        var sib = line.nextElementSibling;
+                                        if (sib){
+                                            p = pick(sib.innerText || sib.textContent || '');
+                                            if (p) return p;
+                                        }
+                                        line = line.parentElement;
+                                    }
+                                    return '';
+                                })(arguments[0]);
+                                """,
+                                ele,
+                            ) or ""
+                            precise = str(precise).strip()
+                            if precise:
+                                return precise
+                        except Exception:
+                            pass
                         try:
                             parent = ele.parent()
                             if parent:
